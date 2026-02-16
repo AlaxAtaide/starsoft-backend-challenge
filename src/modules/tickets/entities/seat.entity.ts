@@ -20,4 +20,7 @@ export class SeatEntity {
 
   @Column({ type: 'varchar', length: 20, default: 'AVAILABLE' })
   status!: SeatStatus;
+
+  @Column({ type: 'uuid', nullable: true })
+  reservationId!: string | null;
 }

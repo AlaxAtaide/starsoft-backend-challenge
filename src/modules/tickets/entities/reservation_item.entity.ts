@@ -19,4 +19,7 @@ export class ReservationItemEntity {
 
   @ManyToOne(() => SeatEntity, { onDelete: 'RESTRICT' })
   seat!: SeatEntity;
+
+  @Column({ type: 'int' })
+  seatNumber!: number;
 }

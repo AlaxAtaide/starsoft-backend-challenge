@@ -8,28 +8,28 @@ export class SessionEntity {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
 
-  @Column({ type: 'varchar', length: 200 })
+  @Column({ type: 'varchar', length: 120 })
   movieTitle!: string;
 
   @Column({ type: 'timestamptz' })
   startsAt!: Date;
 
-  @Column({ type: 'varchar', length: 100 })
+  @Column({ type: 'varchar', length: 80 })
   room!: string;
 
   @Column({ type: 'int' })
   seatCount!: number;
 
-  @Column({ type: 'int' }) // em centavos (ex: 2500)
+  @Column({ type: 'int' })
   priceCents!: number;
 
-  @OneToMany(() => SeatEntity, (seat) => seat.session)
+  @OneToMany(() => SeatEntity, (s) => s.session)
   seats!: SeatEntity[];
 
   @OneToMany(() => ReservationEntity, (r) => r.session)
   reservations!: ReservationEntity[];
 
-  @OneToMany(() => SaleEntity, (s) => s.session)
+  @OneToMany(() => SaleEntity, (sale) => sale.session)
   sales!: SaleEntity[];
 
   @CreateDateColumn({ type: 'timestamptz' })

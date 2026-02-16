@@ -5,7 +5,7 @@ import { ReservationItemEntity } from './reservation_item.entity';
 export type ReservationStatus = 'PENDING' | 'CONFIRMED' | 'EXPIRED' | 'CANCELLED';
 
 @Entity('reservations')
-@Index(['idempotencyKey'], { unique: true })
+@Index(['sessionId', 'idempotencyKey'], { unique: true })
 export class ReservationEntity {
   @PrimaryGeneratedColumn('uuid')
   id!: string;

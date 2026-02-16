@@ -1,9 +1,8 @@
 import { Column, CreateDateColumn, Entity, Index, ManyToOne, PrimaryGeneratedColumn } from 'typeorm';
 import { SessionEntity } from './session.entity';
-import { ReservationEntity } from './reservation.entity';
 
 @Entity('sales')
-@Index(['reservationId'], { unique: true })
+@Index(['userId'])
 export class SaleEntity {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
@@ -14,14 +13,14 @@ export class SaleEntity {
   @ManyToOne(() => SessionEntity, (s) => s.sales, { onDelete: 'CASCADE' })
   session!: SessionEntity;
 
-  @Column({ type: 'varchar', length: 80 })
-  userId!: string;
-
   @Column({ type: 'uuid' })
   reservationId!: string;
 
-  @ManyToOne(() => ReservationEntity, { onDelete: 'RESTRICT' })
-  reservation!: ReservationEntity;
+  @Column({ type: 'varchar', length: 80 })
+  userId!: string;
+
+  @Column({ type: 'varchar', length: 80 })
+  paymentId!: string;
 
   @Column({ type: 'int' })
   totalCents!: number;
