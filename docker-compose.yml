@@ -41,12 +41,14 @@ services:
       - "3000:3000"
     environment:
       DB_HOST: postgres
-      DB_PORT: 5432
+      DB_PORT: "5432"
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_NAME: ticket_db
+
       REDIS_URL: redis://redis:6379
       RABBITMQ_URL: amqp://rabbitmq:5672
+      RESERVATION_TTL_SECONDS: "30"
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,6 +56,9 @@ services:
         condition: service_started
       rabbitmq:
         condition: service_started
+    volumes:
+      - ./:/app
+      - /app/node_modules
 
 volumes:
   postgres_data:
