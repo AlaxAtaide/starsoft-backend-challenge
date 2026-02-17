@@ -3,13 +3,16 @@ import { Cron } from '@nestjs/schedule';
 import { DataSource } from 'typeorm';
 import { ReservationEntity } from '../entities/reservation.entity';
 import { SeatEntity } from '../entities/seat.entity';
+import { ReservationItemEntity } from '../entities/reservation_item.entity';
 import { RabbitMQService } from '../messaging/rabbitmq.service';
+import { PinoLogger } from 'nestjs-pino';
 
 @Injectable()
 export class ReservationExpirationJob {
   constructor(
     private readonly dataSource: DataSource,
     private readonly mq: RabbitMQService,
+    private readonly logger: PinoLogger,
   ) {}
 
   @Cron('*/5 * * * * *') // a cada 5s
@@ -24,6 +27,7 @@ export class ReservationExpirationJob {
         .getMany();
 
       if (expired.length === 0) return;
+      this.logger.debug({ count: expired.length }, 'Found expired reservations');
 
       // 2) marca como EXPIRED
       await manager
@@ -49,10 +53,16 @@ export class ReservationExpirationJob {
           userId: r.userId,
           expiresAt: r.expiresAt,
         });
+
+        const items = await manager.find(ReservationItemEntity, {
+          where: { reservationId: r.id },
+        });
         await this.mq.publish('seat.released', {
           reservationId: r.id,
           sessionId: r.sessionId,
+          seatNumbers: items.map((i) => i.seatNumber),
         });
+        this.logger.info({ reservationId: r.id, sessionId: r.sessionId, seatNumbers: items.map((i) => i.seatNumber) }, 'Reservation expiration processed');
       }
     });
   }
