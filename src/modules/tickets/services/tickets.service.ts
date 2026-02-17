@@ -4,7 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { DataSource, In } from 'typeorm';
+import { DataSource, In, EntityManager } from 'typeorm';
 import { PinoLogger } from 'nestjs-pino';
 import { CreateSessionDto } from '../dto/create-session.dto';
 import { CreateReservationDto } from '../dto/create-reservation.dto';
@@ -23,6 +23,34 @@ export class TicketsService {
     private readonly mq: RabbitMQService,
     private readonly logger: PinoLogger,
   ) {}
+
+  private async withDeadlockRetry<T>(
+    fn: (manager: EntityManager) => Promise<T>,
+    maxAttempts = 3,
+    baseDelayMs = 50,
+  ): Promise<T> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.dataSource.transaction(fn);
+      } catch (err: any) {
+        const code = err?.code ?? err?.driverError?.code;
+        const isDeadlock = code === '40P01'; // Postgres deadlock
+        const isSerialization = code === '40001'; // could not serialize access
+        if ((isDeadlock || isSerialization) && attempt < maxAttempts) {
+          const delay = baseDelayMs * attempt;
+          this.logger.warn(
+            { attempt, code, delayMs: delay },
+            'Deadlock/serialization detected, retrying transaction',
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
+        throw err;
+      }
+    }
+    // Should not reach here
+    throw new Error('Transaction retry attempts exhausted');
+  }
 
   private ttlSeconds(): number {
     const n = Number(process.env.RESERVATION_TTL_SECONDS ?? '30');
@@ -60,7 +88,10 @@ export class TicketsService {
         }),
       );
       await manager.save(seats);
-      this.logger.info({ sessionId: session.id, seatCount: session.seatCount }, 'Session created');
+      this.logger.info(
+        { sessionId: session.id, seatCount: session.seatCount },
+        'Session created',
+      );
       return {
         id: session.id,
         movieTitle: session.movieTitle,
@@ -74,7 +105,9 @@ export class TicketsService {
 
   async getAvailability(sessionId: string) {
     this.logger.debug({ sessionId }, 'Getting availability');
-    const session = await this.dataSource.getRepository(SessionEntity).findOne({ where: { id: sessionId } });
+    const session = await this.dataSource
+      .getRepository(SessionEntity)
+      .findOne({ where: { id: sessionId } });
     if (!session) throw new NotFoundException('Session not found');
 
     const seats = await this.dataSource.getRepository(SeatEntity).find({
@@ -87,7 +120,10 @@ export class TicketsService {
         acc[s.status] += 1;
         return acc;
       },
-      { AVAILABLE: 0, RESERVED: 0, SOLD: 0 } as Record<'AVAILABLE' | 'RESERVED' | 'SOLD', number>,
+      { AVAILABLE: 0, RESERVED: 0, SOLD: 0 } as Record<
+        'AVAILABLE' | 'RESERVED' | 'SOLD',
+        number
+      >,
     );
 
     return {
@@ -102,15 +138,25 @@ export class TicketsService {
   }
 
   async createReservation(sessionId: string, dto: CreateReservationDto) {
-    this.logger.info({ sessionId, seats: dto.seats, userId: dto.userId, idempotencyKey: dto.idempotencyKey }, 'Creating reservation');
+    this.logger.info(
+      {
+        sessionId,
+        seats: dto.seats,
+        userId: dto.userId,
+        idempotencyKey: dto.idempotencyKey,
+      },
+      'Creating reservation',
+    );
     // normalize / remove duplicados
     const requestedSeats = Array.from(new Set(dto.seats.map((n) => Number(n))));
 
     // Evita deadlock: sempre trava na mesma ordem
     requestedSeats.sort((a, b) => a - b);
 
-    return this.dataSource.transaction(async (manager) => {
-      const session = await manager.findOne(SessionEntity, { where: { id: sessionId } });
+    return this.withDeadlockRetry(async (manager) => {
+      const session = await manager.findOne(SessionEntity, {
+        where: { id: sessionId },
+      });
       if (!session) throw new NotFoundException('Session not found');
 
       // range
@@ -128,7 +174,10 @@ export class TicketsService {
         });
 
         if (existing) {
-          this.logger.info({ reservationId: existing.id }, 'Reservation idempotency hit');
+          this.logger.info(
+            { reservationId: existing.id },
+            'Reservation idempotency hit',
+          );
           return {
             id: existing.id,
             status: existing.status,
@@ -153,8 +202,10 @@ export class TicketsService {
 
       // se algum ocupado, falha
       for (const s of seats) {
-        if (s.status === 'SOLD') throw new ConflictException(`Seat ${s.number} already sold`);
-        if (s.status === 'RESERVED') throw new ConflictException(`Seat ${s.number} is reserved`);
+        if (s.status === 'SOLD')
+          throw new ConflictException(`Seat ${s.number} already sold`);
+        if (s.status === 'RESERVED')
+          throw new ConflictException(`Seat ${s.number} is reserved`);
       }
 
       const expiresAt = new Date(Date.now() + this.ttlSeconds() * 1000);
@@ -190,7 +241,15 @@ export class TicketsService {
         seats: requestedSeats,
         expiresAt,
       });
-      this.logger.info({ reservationId: reservation.id, sessionId, userId: dto.userId, seats: requestedSeats }, 'Reservation created');
+      this.logger.info(
+        {
+          reservationId: reservation.id,
+          sessionId,
+          userId: dto.userId,
+          seats: requestedSeats,
+        },
+        'Reservation created',
+      );
 
       return {
         id: reservation.id,
@@ -202,8 +261,11 @@ export class TicketsService {
   }
 
   async confirmPayment(reservationId: string, dto: ConfirmPaymentDto) {
-    this.logger.info({ reservationId, userId: dto.userId, paymentId: dto.paymentId }, 'Confirming payment');
-    return this.dataSource.transaction(async (manager) => {
+    this.logger.info(
+      { reservationId, userId: dto.userId, paymentId: dto.paymentId },
+      'Confirming payment',
+    );
+    return this.withDeadlockRetry(async (manager) => {
       // trava a reserva
       const reservation = await manager
         .createQueryBuilder(ReservationEntity, 'r')
@@ -247,7 +309,10 @@ export class TicketsService {
           sessionId: reservation.sessionId,
           seatNumbers: expiredItems.map((i) => i.seatNumber),
         });
-        this.logger.warn({ reservationId: reservation.id }, 'Reservation expired during payment confirm');
+        this.logger.warn(
+          { reservationId: reservation.id },
+          'Reservation expired during payment confirm',
+        );
 
         throw new ConflictException('Reservation expired');
       }
@@ -256,7 +321,8 @@ export class TicketsService {
       const items = await manager.find(ReservationItemEntity, {
         where: { reservationId: reservation.id },
       });
-      if (items.length === 0) throw new ConflictException('Reservation has no items');
+      if (items.length === 0)
+        throw new ConflictException('Reservation has no items');
 
       // trava seats envolvidos
       const seatIds = items.map((i) => i.seatId);
@@ -269,26 +335,38 @@ export class TicketsService {
 
       // valida ainda RESERVED pela reserva
       for (const s of seats) {
-        if (s.status === 'SOLD') throw new ConflictException(`Seat ${s.number} already sold`);
-        if (s.reservationId !== reservation.id) throw new ConflictException(`Seat ${s.number} not reserved by this reservation`);
+        if (s.status === 'SOLD')
+          throw new ConflictException(`Seat ${s.number} already sold`);
+        if (s.reservationId !== reservation.id)
+          throw new ConflictException(
+            `Seat ${s.number} not reserved by this reservation`,
+          );
       }
 
       // marca reserva confirmada
       reservation.status = 'CONFIRMED';
       await manager.save(reservation);
-      this.logger.info({ reservationId: reservation.id }, 'Reservation confirmed');
+      this.logger.info(
+        { reservationId: reservation.id },
+        'Reservation confirmed',
+      );
 
       // prepara seatNumbers e marca seats SOLD
-      const seatNumbers = items.map((i) => i.seatNumber);
+      const seatNumbers = items.map((i) => i.seatNumber).sort((a, b) => a - b);
       await manager.update(
         SeatEntity,
         { id: In(seatIds) },
         { status: 'SOLD', reservationId: null },
       );
-      this.logger.info({ reservationId: reservation.id, seatNumbers }, 'Seats marked as SOLD');
+      this.logger.info(
+        { reservationId: reservation.id, seatNumbers },
+        'Seats marked as SOLD',
+      );
 
       // cria venda
-      const session = await manager.findOne(SessionEntity, { where: { id: reservation.sessionId } });
+      const session = await manager.findOne(SessionEntity, {
+        where: { id: reservation.sessionId },
+      });
       if (!session) throw new NotFoundException('Session not found');
 
       const sale = manager.create(SaleEntity, {
@@ -310,7 +388,14 @@ export class TicketsService {
         totalPriceCents: sale.totalPriceCents,
         createdAt: sale.createdAt,
       });
-      this.logger.info({ saleId: sale.id, reservationId: reservation.id, totalPriceCents: sale.totalPriceCents }, 'Sale confirmed event published');
+      this.logger.info(
+        {
+          saleId: sale.id,
+          reservationId: reservation.id,
+          totalPriceCents: sale.totalPriceCents,
+        },
+        'Sale confirmed event published',
+      );
 
       return {
         saleId: sale.id,
