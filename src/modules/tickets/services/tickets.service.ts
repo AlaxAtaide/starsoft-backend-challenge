@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { DataSource, In } from 'typeorm';
+import { PinoLogger } from 'nestjs-pino';
 import { CreateSessionDto } from '../dto/create-session.dto';
 import { CreateReservationDto } from '../dto/create-reservation.dto';
 import { ConfirmPaymentDto } from '../dto/confirm-payment.dto';
@@ -20,6 +21,7 @@ export class TicketsService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly mq: RabbitMQService,
+    private readonly logger: PinoLogger,
   ) {}
 
   private ttlSeconds(): number {
@@ -28,9 +30,14 @@ export class TicketsService {
   }
 
   async createSession(dto: CreateSessionDto) {
+    this.logger.info({ dto }, 'Creating session');
     const startsAt = new Date(dto.startsAt);
     if (Number.isNaN(startsAt.getTime())) {
       throw new BadRequestException('startsAt must be a valid ISO date');
+    }
+
+    if (!Number.isInteger(dto.seatCount) || dto.seatCount < 16) {
+      throw new BadRequestException('seatCount must be an integer >= 16');
     }
 
     return this.dataSource.transaction(async (manager) => {
@@ -53,7 +60,7 @@ export class TicketsService {
         }),
       );
       await manager.save(seats);
-
+      this.logger.info({ sessionId: session.id, seatCount: session.seatCount }, 'Session created');
       return {
         id: session.id,
         movieTitle: session.movieTitle,
@@ -66,6 +73,7 @@ export class TicketsService {
   }
 
   async getAvailability(sessionId: string) {
+    this.logger.debug({ sessionId }, 'Getting availability');
     const session = await this.dataSource.getRepository(SessionEntity).findOne({ where: { id: sessionId } });
     if (!session) throw new NotFoundException('Session not found');
 
@@ -94,6 +102,7 @@ export class TicketsService {
   }
 
   async createReservation(sessionId: string, dto: CreateReservationDto) {
+    this.logger.info({ sessionId, seats: dto.seats, userId: dto.userId, idempotencyKey: dto.idempotencyKey }, 'Creating reservation');
     // normalize / remove duplicados
     const requestedSeats = Array.from(new Set(dto.seats.map((n) => Number(n))));
 
@@ -119,6 +128,7 @@ export class TicketsService {
         });
 
         if (existing) {
+          this.logger.info({ reservationId: existing.id }, 'Reservation idempotency hit');
           return {
             id: existing.id,
             status: existing.status,
@@ -180,6 +190,7 @@ export class TicketsService {
         seats: requestedSeats,
         expiresAt,
       });
+      this.logger.info({ reservationId: reservation.id, sessionId, userId: dto.userId, seats: requestedSeats }, 'Reservation created');
 
       return {
         id: reservation.id,
@@ -191,6 +202,7 @@ export class TicketsService {
   }
 
   async confirmPayment(reservationId: string, dto: ConfirmPaymentDto) {
+    this.logger.info({ reservationId, userId: dto.userId, paymentId: dto.paymentId }, 'Confirming payment');
     return this.dataSource.transaction(async (manager) => {
       // trava a reserva
       const reservation = await manager
@@ -205,12 +217,6 @@ export class TicketsService {
         throw new ConflictException('Reservation does not belong to this user');
       }
 
-      // já confirmada? idempotência do pagamento
-      if (reservation.status === 'CONFIRMED') {
-        const sale = await manager.findOne(SaleEntity, { where: { reservationId: reservation.id } });
-        return { status: 'CONFIRMED', saleId: sale?.id ?? null };
-      }
-
       // expirou?
       if (reservation.status !== 'PENDING') {
         throw new ConflictException(`Reservation is ${reservation.status}`);
@@ -219,6 +225,11 @@ export class TicketsService {
         // marca expirado e libera seats aqui mesmo
         reservation.status = 'EXPIRED';
         await manager.save(reservation);
+
+        // pega itens para auditar assentos liberados
+        const expiredItems = await manager.find(ReservationItemEntity, {
+          where: { reservationId: reservation.id },
+        });
         await manager
           .createQueryBuilder()
           .update(SeatEntity)
@@ -226,8 +237,17 @@ export class TicketsService {
           .where('reservationId = :rid', { rid: reservation.id })
           .execute();
 
-        await this.mq.publish('reservation.expired', { reservationId: reservation.id });
-        await this.mq.publish('seat.released', { reservationId: reservation.id });
+        await this.mq.publish('reservation.expired', {
+          reservationId: reservation.id,
+          sessionId: reservation.sessionId,
+          userId: reservation.userId,
+        });
+        await this.mq.publish('seat.released', {
+          reservationId: reservation.id,
+          sessionId: reservation.sessionId,
+          seatNumbers: expiredItems.map((i) => i.seatNumber),
+        });
+        this.logger.warn({ reservationId: reservation.id }, 'Reservation expired during payment confirm');
 
         throw new ConflictException('Reservation expired');
       }
@@ -256,13 +276,16 @@ export class TicketsService {
       // marca reserva confirmada
       reservation.status = 'CONFIRMED';
       await manager.save(reservation);
+      this.logger.info({ reservationId: reservation.id }, 'Reservation confirmed');
 
-      // marca seats SOLD
+      // prepara seatNumbers e marca seats SOLD
+      const seatNumbers = items.map((i) => i.seatNumber);
       await manager.update(
         SeatEntity,
         { id: In(seatIds) },
-        { status: 'SOLD' },
+        { status: 'SOLD', reservationId: null },
       );
+      this.logger.info({ reservationId: reservation.id, seatNumbers }, 'Seats marked as SOLD');
 
       // cria venda
       const session = await manager.findOne(SessionEntity, { where: { id: reservation.sessionId } });
@@ -273,28 +296,33 @@ export class TicketsService {
         reservationId: reservation.id,
         userId: reservation.userId,
         paymentId: dto.paymentId,
-        totalCents: session.priceCents * items.length,
+        totalPriceCents: session.priceCents * items.length,
+        seatNumbers,
       });
       await manager.save(sale);
 
-      await this.mq.publish('payment.confirmed', {
+      await this.mq.publish('sale.confirmed', {
         saleId: sale.id,
         reservationId: reservation.id,
         sessionId: reservation.sessionId,
         userId: reservation.userId,
-        seatNumbers: items.map((i) => i.seatNumber),
-        totalCents: sale.totalCents,
+        seatNumbers,
+        totalPriceCents: sale.totalPriceCents,
+        createdAt: sale.createdAt,
       });
+      this.logger.info({ saleId: sale.id, reservationId: reservation.id, totalPriceCents: sale.totalPriceCents }, 'Sale confirmed event published');
 
       return {
         saleId: sale.id,
-        status: 'CONFIRMED',
-        totalCents: sale.totalCents,
+        reservationId: reservation.id,
+        seats: seatNumbers,
+        totalPriceCents: sale.totalPriceCents,
       };
     });
   }
 
   async getPurchases(userId: string, limit = 50) {
+    this.logger.debug({ userId, limit }, 'Getting purchases');
     const sales = await this.dataSource.getRepository(SaleEntity).find({
       where: { userId },
       order: { createdAt: 'DESC' },
@@ -309,9 +337,27 @@ export class TicketsService {
         sessionId: s.sessionId,
         reservationId: s.reservationId,
         paymentId: s.paymentId,
-        totalCents: s.totalCents,
+        totalPriceCents: s.totalPriceCents,
+        seatNumbers: s.seatNumbers,
         createdAt: s.createdAt,
       })),
+    };
+  }
+
+  async getReservation(reservationId: string) {
+    this.logger.debug({ reservationId }, 'Getting reservation');
+    const r = await this.dataSource.getRepository(ReservationEntity).findOne({
+      where: { id: reservationId },
+      relations: { items: true },
+    });
+    if (!r) throw new NotFoundException('Reservation not found');
+    return {
+      id: r.id,
+      status: r.status,
+      expiresAt: r.expiresAt,
+      sessionId: r.sessionId,
+      userId: r.userId,
+      seats: r.items?.map((i) => i.seatNumber) ?? [],
     };
   }
 }
