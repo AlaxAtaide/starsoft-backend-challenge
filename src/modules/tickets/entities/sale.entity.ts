@@ -23,7 +23,10 @@ export class SaleEntity {
   paymentId!: string;
 
   @Column({ type: 'int' })
-  totalCents!: number;
+  totalPriceCents!: number;
+
+  @Column('int', { array: true })
+  seatNumbers!: number[];
 
   @CreateDateColumn({ type: 'timestamptz' })
   createdAt!: Date;
