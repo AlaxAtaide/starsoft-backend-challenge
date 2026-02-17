@@ -1,14 +1,15 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-
-import { SeatEntity } from './entities/seat.entity';
+import { TicketsController } from './controllers/tickets.controller';
+import { TicketsService } from './services/tickets.service';
 import { SessionEntity } from './entities/session.entity';
+import { SeatEntity } from './entities/seat.entity';
 import { ReservationEntity } from './entities/reservation.entity';
 import { ReservationItemEntity } from './entities/reservation_item.entity';
 import { SaleEntity } from './entities/sale.entity';
-
-import { TicketsController } from './controllers/tickets.controller';
-import { TicketsService } from './services/tickets.service';
+import { RabbitMQService } from './messaging/rabbitmq.service';
+import { EventsConsumer } from './messaging/events.consumer';
+import { ReservationExpirationJob } from './jobs/reservation-expiration.job';
 
 @Module({
   imports: [
@@ -21,6 +22,11 @@ import { TicketsService } from './services/tickets.service';
     ]),
   ],
   controllers: [TicketsController],
-  providers: [TicketsService],
+  providers: [
+    TicketsService,
+    RabbitMQService,
+    EventsConsumer,
+    ReservationExpirationJob,
+  ],
 })
 export class TicketsModule {}
